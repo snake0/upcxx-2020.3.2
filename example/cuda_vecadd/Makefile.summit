@@ -1,0 +1,5 @@
+CFLAGS=-O2
+
+vecadd: vecadd.cpp kernels.cu kernels.hpp
+	nvcc -c -arch=sm_30 $(CFLAGS) kernels.cu -o kernels.o
+	upcxx $(CFLAGS) kernels.o vecadd.cpp -o $@

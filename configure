@@ -1,0 +1,990 @@
+#!/bin/sh
+#
+# This file is NOT generated (e.g. don't look for configure.ac).
+#
+# TODO:
+#  + sanitize/filter GASNET_CONFIGURE_ARGS ??
+
+##
+## Begin portable (no bash-isms) logic to check for correct shell.
+## We try to reexec with bash if present in $PATH
+##
+
+# Note tcsh graciously yields 'BASH_VERSION: Undefined variable' before giving up here.
+if test -z "$BASH_VERSION"; then
+  if test -z "$UPCXX_REEXEC"; then
+    exec env UPCXX_REEXEC=1 bash "$0" "$@"
+  fi
+fi
+
+# Minimum we claim to support is 3.2
+UPCXX_BASH_MAJ=3
+UPCXX_BASH_MIN=2
+
+bad_shell() {
+  echo "ERROR: UPC++ requires bash in \$PATH, version $UPCXX_BASH_MAJ.$UPCXX_BASH_MIN or newer." >&2
+  echo "ERROR: $*" >&2
+  exit 1
+}
+
+# Either could not exec bash in $PATH or we did and it is not bash
+if test -z "$BASH_VERSION" || test -z "$BASH"; then
+  bad_shell 'bash was not found in $PATH, or does not appear to be bash.'
+fi
+
+##
+## End portable (no bash-isms) logic.
+## We may now assume we are running bash
+##
+
+if test ${BASH_VERSINFO[0]} -lt $UPCXX_BASH_MAJ ||
+ ( test ${BASH_VERSINFO[0]} -eq $UPCXX_BASH_MAJ && test ${BASH_VERSINFO[1]} -lt $UPCXX_BASH_MIN ); then
+  bad_shell "This bash reports a version of '$BASH_VERSION'."
+fi
+set +o posix
+
+# Record the full command line (with shell quoting, suitable for reexecution).
+# The value has ": " prefixed, but rather than trim that off, we encorporate
+# it into the final output.
+fullcmd=$(set -- "$0" "$@"; PS4=; exec 2>&1; set -x; : "$@")
+
+# Preserve command and all output for post mortem
+if [[ -z "$UPCXX_CONFIGURE_TEED" ]]; then
+  echo "UPC++ configure$fullcmd" >| config.log
+  exec &> >(tee -a config.log)
+  UPCXX_CONFIGURE_TEED=y exec $BASH "$0" "$@"
+fi
+
+#
+# Usage
+#
+
+function usage {
+  cat <<'EOF'
+Usage:
+  --prefix=...
+        Specifies the installation directory.
+        The default is '/usr/local/upcxx'.
+
+  --with-cc=...
+  --with-cxx=...
+        Specify the C and C++ compilers to use.
+        Override the values of $CC and $CXX, if any.
+        The (platform dependent) default is usually appropriate.
+  --with-cross(=...)
+  --without-cross
+        Control cross-compilation.
+        Passing `--with-cross` (without a value) requests the default
+        auto-detection behavior, while providing a value requests a
+        specific cross-compilation target.
+        Passing `--without-cross` disables cross-compilation.
+        Overrides the value of $UPCXX_CROSS, if any.
+        The default behavior (auto-detection) is appropriate unless
+        auto-detection is making the wrong choice.
+
+  --with-cuda
+  --without-cuda
+        Enabled or disable UPC++ Memory Kinds over NVIDIA CUDA.
+        Overrides the value of $UPCXX_CUDA, if any.
+  --with-nvcc=...
+        Overrides the value of $UPCXX_CUDA_NVCC, if any.
+        The default is to search for 'nvcc' in $PATH.
+  --with-cuda-cppflags=...
+        Sets the pre-processor flags needed to find CUDA runtime headers.
+        Overrides the value of $UPCXX_CUDA_CPPFLAGS, if any.
+        The default is to search probe 'nvcc'.
+  --with-cuda-libflags=...
+        Sets the linker flags needed to link CUDA runtime libraries.
+        Overrides the value of $UPCXX_CUDA_LIBFLAGS, if any.
+        The default is to search probe 'nvcc'.
+
+  --with-default-network=...
+        Specifies the default network.
+        The default is system dependent.
+
+  --with-gasnet=...
+        Specifies the URL or path of GASNet sources.
+        Overrides the value of $GASNET, if any.
+        The default is normally sufficient.
+
+  --with-gmake=...
+        Specify the location of GNU Make 3.80 or newer.
+        Overrides the value of $GMAKE, if any.
+        Default is to search for 'gmake' or 'make' in $PATH.
+  --with-python=...
+        Specify the location of Python3 or Python2 version 2.7.5 or newer.
+        Overrides the value of $UPCXX_PYTHON, if any.
+        Default is to search for common Python interpreter names in $PATH
+        at configure time for any meeting the version requirement.  The first
+        one thus identified is then located in $PATH dynamically at runtime.
+
+  -h|--help|--usage
+        Produces this message.
+  --help=recursive
+        Produces this message and GASNet's `configure --help` message.
+  -V|--version
+        Report version and copyright.
+
+All unrecognized arguments will be passed to GASNet's configure.
+
+Some influential environment variables:
+  CXX         C++ compiler command
+  CXXFLAGS    C++ compiler flags
+  CXXCPP      C++ preprocessor
+  CC          C compiler command
+  CFLAGS      C compiler flags
+  CPP         C preprocessor
+  CPPFLAGS    C/C++ preprocessor flags, e.g. -I<include dir> if you have
+              headers in a nonstandard directory <include dir>
+  LDFLAGS     linker flags, e.g. -L<lib dir> if you have libraries in a
+              nonstandard directory <lib dir>
+  LIBS        libraries to pass to the linker, e.g. -l<library>
+Use these variables to override the choices made by `configure' or to help
+it to find libraries and programs with nonstandard names/locations.
+
+Report bugs to upcxx@googlegroups.com or at https://upcxx-bugs.lbl.gov
+UPC++ home page: https://upcxx.lbl.gov
+
+See INSTALL.md for additional information.
+EOF
+}
+
+function version {
+  header="$UPCXX_SRC/src/upcxx.hpp"
+  version=$(grep "# *define  *UPCXX_VERSION " ${header} 2>/dev/null| head -1)
+  if [[ "$version" =~ ([0-9]{4})([0-9]{2})([0-9]{2}) ]]; then
+    version="${BASH_REMATCH[1]}.${BASH_REMATCH[2]#0}.${BASH_REMATCH[3]#0}"
+  else
+    version=${version##*UPCXX_VERSION }
+  fi
+  githash=$(git describe --always 2> /dev/null)
+  echo "UPC++ version $version $githash"
+  echo "Copyright (c) 2020, The Regents of the University of California,"
+  echo "through Lawrence Berkeley National Laboratory."
+  echo "https://upcxx.lbl.gov"
+  echo ""
+}
+
+#
+# Global variables
+#
+
+# This script's name and location
+self=$(basename $0)
+UPCXX_SRC=$(cd $(dirname $(type -p $0)) && pwd -P)
+
+# Default installation prefix
+PREFIX=/usr/local/upcxx
+
+# Undocumented "--enable-single" mode
+single=''
+
+# Text to emit at end
+# Each distinct warning added should start with a newline
+warnings=''
+
+# backwards compat: CROSS
+# must preserve both unset and set-but-empty, which have significance
+if [[ ${UPCXX_CROSS-unset}${CROSS+set} == 'unsetset' ]]; then
+  export UPCXX_CROSS=${CROSS}
+fi
+
+unset gasnet_help
+
+#
+# Error handling
+#
+
+function echo_and_die {
+  echo $* >&2
+  exit 1
+}
+
+function failure_and_die {
+  echo "UPC++ configuration failed. Please report the entire log above to: upcxx@googlegroups.com" >&2
+  exit 1
+}
+
+function get_arg_val {
+  if [[ "$*" =~ (^[^=]*=(.+)) ]]; then
+    echo "${BASH_REMATCH[2]}"
+  else
+    echo "ERROR: option '${1%=}' is missing its required value." >&2
+    echo "Run '$0 --help' for complete usage information." >&2
+    exit 1
+  fi
+}
+
+#
+# Argument parsing
+#
+
+shopt -s extglob
+trap exit ERR  # so exit in get_arg_val exits from top-level
+# DO NOT simplify 'FOO="$(get_arg_val $1)"; export FOO;' to a single command, or get_arg_val can't fatal-exit
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --prefix?(=*))               PREFIX="$(get_arg_val $1)";;
+
+    --with-gasnet?(=*))          GASNET="$(get_arg_val $1)";         export GASNET;;
+    --with-default-network?(=*)) GASNET_CONDUIT="$(get_arg_val $1)"; export GASNET_CONDUIT;;
+
+    --with-cc?(=*))              CC="$(get_arg_val $1)";    export CC;;
+    --with-cxx?(=*))             CXX="$(get_arg_val $1)";   export CXX;;
+    --with-cross)                unset UPCXX_CROSS;                  export UPCXX_CROSS;;
+    --with-cross?(=*))           UPCXX_CROSS="$(get_arg_val $1)";    export UPCXX_CROSS;;
+    --without-cross)             UPCXX_CROSS='';                     export UPCXX_CROSS;;
+
+    --with-gmake?(=*))           GMAKE="$(get_arg_val $1)"; export GMAKE;;
+    --with-python?(=*))          UPCXX_PYTHON="$(get_arg_val $1)"; export UPCXX_PYTHON;;
+
+    --with-cuda)                 UPCXX_CUDA=1; export UPCXX_CUDA;;
+    --without-cuda)              UPCXX_CUDA=0; export UPCXX_CUDA;;
+    --with-nvcc?(=*))            UPCXX_CUDA_NVCC="$(get_arg_val $1)";     export UPCXX_CUDA_NVCC;;
+    --with-cuda-cppflags?(=*))   UPCXX_CUDA_CPPFLAGS="$(get_arg_val $1)"; export UPCXX_CUDA_CPPFLAGS;;
+    --with-cuda-libflags?(=*))   UPCXX_CUDA_LIBFLAGS="$(get_arg_val $1)"; export UPCXX_CUDA_LIBFLAGS;;
+
+    -h|--help|--usage)
+      echo 'UPC++ configure script.'
+      echo '======================='
+      usage;
+      exit 0;
+      ;;
+
+    --help=recursive)
+      echo 'UPC++ configure script.'
+      echo '======================='
+      usage;
+      echo
+      echo 'GASNet-EX configure script.'
+      echo '==========================='
+      gasnet_help=1
+      ;;
+
+    -V|--version)
+      version;
+      exit 0;
+      ;;
+
+    # These are not in the usage message, but autoconf-familiar users may expect these to work:
+    CC?(=*))   CC="$(get_arg_val $1)";    export CC;;
+    CXX?(=*))  CXX="$(get_arg_val $1)";   export CXX;;
+
+    # These are to remain undocumented
+    -v|--verbose) set -x ;;
+    --enable-single?(=*))
+      single="$(get_arg_val $1)"
+      warnings+="\nWARNING: --enable-single=$single mode enabled.\n"
+      warnings+='WARNING: This mode is intended for maintainers only.\n'
+      warnings+='WARNING: Many make targets will fail and components will be missing.\n'
+      ;;
+    --with-mpsc-queue=*)
+      UPCXX_MPSC_QUEUE="$(get_arg_val $1)"; export UPCXX_MPSC_QUEUE
+      ;;
+
+    # Anything we don't consume will be passed to GASNet's configure
+    # Quoting is believed sufficient for space, tab, single-quote and double-quote.
+    *)
+      GASNET_CONFIGURE_ARGS+="${GASNET_CONFIGURE_ARGS+ }\"${1//\"/\\\"}\""
+      ;;
+  esac
+  shift
+done  
+
+trap failure_and_die ERR  # errors after arg parsing are fatal
+
+#
+# Helper functions
+#
+
+# Warn if a prog was found outside a whitelist of paths
+function check_known_path {
+  case $(dirname "$1") in
+    /bin|/usr/bin|/usr/local/bin|/usr/pkg/bin|/opt/csw/bin)
+      # OK
+      ;;
+    *)
+      warnings+="${2+\nWARNING: $2\n}"
+      warnings+='WARNING: This full path will be encoded in installed scripts.\n'
+      warnings+='WARNING: Please ensure it is valid for all users and on all nodes.\n'
+  esac
+}
+
+# check_tool_path()
+#
+# input: the path or filename to check
+# accepts full paths
+# searches for bare names (no /) in $PATH
+# rejects relative paths and bare names not found in $PATH
+# also rejects any input which is missing or not executable
+# on success returns zero with absolute path on stdout
+# returns non-zero on failure with (partial) error message on stdout
+check_tool_path() {
+  local exe="${1%% *}"
+  local args="${1/$exe}"
+  if [[ $exe =~ ^/ ]]; then
+    # full path: check that it exists and is executable
+    if [[ ! -x $exe ]]; then
+      echo 'does not exist or is not executable'
+      return 1
+    fi
+    echo "$exe$args"
+  elif [[ ! $exe =~ / ]]; then
+    # bare tool name: search in $PATH
+    local output=$(type -p "$exe" 2>/dev/null || true)
+    if [[ -z $output || ! -x $output ]]; then
+      echo 'was not found in $PATH'
+      return 1
+    fi
+    echo "$output$args"
+  else
+    # relative path: prohibited
+    echo 'is a relative path (not permitted)'
+    return 1
+  fi
+  return 0
+}
+
+#
+# Default GASNet source
+# Enable offline installers with an embedded GASNet-EX tarball
+#
+GASNET_DEFAULT='https://gasnet.lbl.gov/EX/GASNet-2020.3.0.tar.gz'
+gex_offline=`/bin/ls "$UPCXX_SRC"/src/GASNet-{stable,2???.*}.tar.gz 2> /dev/null | sort -t. -k1,1 -k2,2n -k3n | tail -1`
+if [[ -n "$GASNET" ]]; then
+  : # keep defn
+elif [[ -r "$gex_offline" ]]; then
+  GASNET="$gex_offline"
+else
+  GASNET=$GASNET_DEFAULT
+fi
+
+#
+# Fetch and unpack GASNet (as required) and verify
+#
+
+function bad_gasnet_fetch {
+  echo Error: $* >&2
+  echo_and_die "Please correct the URL or point --with-gasnet=... at a manually downloaded GASNet source .tar.gz file ($GASNET_DEFAULT is the recommended version)"
+}
+ORIG_GASNET="$GASNET"
+GASNET_UNPACKED=""
+GASNET_TYPE=source  # default
+if [[ -n "$single" && -r "$GASNET/gasnet_config.h" ]] ; then
+  # single + GASNET=builddir (may or may not be a srcdir as well)
+  GASNET_TYPE=build
+  # Convert relative path of build directory to absolute if necessary
+  if ! expr "$GASNET" : ^/ >/dev/null; then
+    export GASNET=$(cd "$GASNET" && pwd -P)
+  fi
+elif [ -r "$GASNET/gasnet_config.h.in" ]; then
+  # Convert relative path of souce directory to absolute if necessary
+  if ! expr "$GASNET" : ^/ >/dev/null; then
+    export GASNET=$(cd "$GASNET" && pwd -P)
+  fi
+elif expr "$GASNET" : '.*\.tar\.gz' >/dev/null; then
+  # Unpack tarball into bld/ unless already present
+  gex_dir="$PWD/bld/`basename $GASNET .tar.gz`"
+  gex_tmp=''
+  if [ ! -r "$gex_dir/gasnet_config.h.in" ]; then
+    trap - ERR # suspend error handler for detailed diagnostics
+    mkdir -p bld
+    if expr "$GASNET" : http >/dev/null; then
+      if [[ -n "$URL_CAT" ]] ; then
+        : # keep defn
+      elif [[ -n "$(type -p curl)" ]]; then
+        URL_CAT='curl --retry 5 -LsSf'
+      elif [[ -n "$(type -p wget)" ]]; then
+        URL_CAT='wget --tries=5 -nv -O -'
+      fi
+      if [ -z "$URL_CAT" ]; then
+        bad_gasnet_fetch "Do not know how to fetch a URL (did not find wget or curl in \$PATH)"
+      fi
+      gex_tmp="$gex_dir.tar.gz"
+      echo Fetching $GASNET
+      eval "$URL_CAT '$GASNET' >'$gex_tmp'"
+      [[ $? -eq 0 && -r "$gex_tmp" ]] || bad_gasnet_fetch "Failed to fetch '$GASNET'"
+      GASNET="$gex_tmp"
+    else
+      [ -e "$GASNET" ] || echo_and_die "File '$GASNET' does not exist"
+      [ -r "$GASNET" ] || echo_and_die "Cannot read file '$GASNET'"
+    fi
+    echo Unpacking $GASNET
+    gzip -cd "$GASNET" | ( cd bld && tar xf - )
+    rc1=${PIPESTATUS[0]} rc2=${PIPESTATUS[1]}
+    [ $rc1 -eq 0 ] || echo_and_die "Failed to gunzip '$GASNET' (corrupted or truncated?)"
+    [ $rc2 -eq 0 ] || echo_and_die "Failed to untar '$GASNET' (corrupted or truncated?)"
+    [ -r "$gex_dir/gasnet_config.h.in" ] || echo_and_die "GASNET='$ORIG_GASNET' does not appear to contain GASNet"
+    trap failure_and_die ERR  # restore error handler
+    [ -n "$gex_tmp" ] && rm -f "$gex_tmp"
+    GASNET_UNPACKED=$gex_dir
+    echo
+  fi
+  export GASNET="$gex_dir"
+else
+  echo_and_die "GASNET must point to local tarball file, tarball url, or gasnet source tree."
+fi
+
+if [[ "$GASNET_TYPE" == 'build' ]]; then
+  if [ -e "$GASNET/configure" ] ; then
+    gex_header="$GASNET/gasnetex.h"
+  else
+    gex_header=''  # TODO: any non G-1 file to check in a VPATH build directory?
+  fi
+  gex_spec_file="$GASNET/gasnet_config.h"
+else
+  gex_header="$GASNET/gasnetex.h"
+  gex_spec_file=$(echo $GASNET/docs/GASNet-EX.*)
+fi
+
+# verify distinguishing file (if any)
+[[ -z "$gex_header" || -r "$gex_header" ]] || \
+    echo_and_die "GASNET='$ORIG_GASNET' does not contain GASNet-EX (GASNet-1 or GASNet_Tools?)"
+
+# verify minimum version
+[[ $(grep 'EX_SPEC_VERSION_MAJOR' "$gex_spec_file" | head -1 | tr '\t' ' ') =~ ( ([0-9]+)) ]]
+HAVE_MAJ=${BASH_REMATCH[2]}
+[[ $(grep 'EX_SPEC_VERSION_MINOR' "$gex_spec_file" | head -1 | tr '\t' ' ') =~ ( ([0-9]+)) ]]
+HAVE_MIN=${BASH_REMATCH[2]}
+upcxx_header="$UPCXX_SRC/src/backend/gasnet/runtime_internal.hpp"
+[[ $(grep 'UPCXX_REQUIRES_GEX_SPEC_VERSION_MAJOR.*' "$upcxx_header" | head -1 | tr '\t' ' ') =~ ( ([0-9]+)) ]]
+WANT_MAJ=${BASH_REMATCH[2]}
+[[ $(grep 'UPCXX_REQUIRES_GEX_SPEC_VERSION_MINOR.*' "$upcxx_header" | head -1 | tr '\t' ' ') =~ ( ([0-9]+)) ]]
+WANT_MIN=${BASH_REMATCH[2]}
+[[ ($HAVE_MAJ -gt $WANT_MAJ) || (($HAVE_MAJ -eq $WANT_MAJ) && ($HAVE_MIN -ge $WANT_MIN)) ]] || \
+    echo_and_die "GASNET='$ORIG_GASNET' does not contain GASNet-EX implementing specification version $WANT_MAJ.$WANT_MIN or newer"
+
+#
+# GASNet's help message if requested
+#
+if [[ -n "$gasnet_help" ]]; then
+  exec $GASNET/configure --help
+  echo "Failed to run GASNet's configure --help"
+  exit 1
+fi
+
+#
+# Canonicalize $PREFIX
+#
+
+# Form a "textually canonical" path.
+#
+# + Result is a full path without any extraneous / or .
+#
+# + The input path can be relative or absolute
+# + White space in path is safe and is preserved
+# + The input path does not need to exist (and is not created)
+#
+# + Does NOT verify elems are dirs (so /etc/passwd/foo is acceptable)
+# + Does NOT resolve symlinks
+#
+function canon_path() {
+  local path="$1"
+
+  # Make absolute if relative
+  [[ "$path" =~ (^/) ]] || path="$PWD/$path"
+
+  # Ensure trailing '/.' and '/..' are not special cases
+  path="$path/"
+
+  # Convert '//' and '/./' to '/'
+  while true; do
+    local tmp=$(sed -e 's|//*|/|g' -e 's|/\./|/|g' <<<"$path")
+    [[ "$tmp" = "$path" ]] && break
+    path="$tmp"
+  done
+
+  # Remove all 'dir/../'
+  while true; do
+    local tmp=$(sed -e 's|[^/][^/]*/\.\./||g' <<<"$path")
+    [[ "$tmp" = "$path" ]] && break
+    path="$tmp"
+  done
+
+  # Convert any leading '/../' to '/'
+  while true; do
+    local tmp=$(sed -e 's|^/\.\./|/|g' <<<"$path")
+    [[ "$tmp" = "$path" ]] && break
+    path="$tmp"
+  done
+
+  path="${path/%\//}" # removes the trailing /
+
+  if [[ -n "$path" ]]; then echo "$path"; else echo '/'; fi
+}
+PREFIX=$(canon_path "$PREFIX")
+
+#
+# --enable-single={opt,debug}
+#
+case $single in
+  '')
+    UPCXX_DBGOPT='debug opt'
+    ;;
+  opt|debug)
+    UPCXX_DBGOPT=$single
+    ;;
+  *)
+    echo_and_die "ERROR: --enable-single='$single' is not a valid option"
+    ;;
+esac
+
+#
+# Default UPCXX_MPSC_QUEUE
+#
+if [[ -z "$UPCXX_MPSC_QUEUE" ]] ; then
+  UPCXX_MPSC_QUEUE=atomic
+else
+  case "$UPCXX_MPSC_QUEUE" in
+    atomic|biglock)
+      ;; # OK
+    *)
+      echo "ERROR: UPCXX_MPSC_QUEUE='$UPCXX_MPSC_QUEUE' is not a valid value."
+      echo_and_die 'See docs/build-devel.md for valid values and additional info.'
+      ;;
+  esac
+fi
+
+#
+# Cross-compilation
+#
+cross_aries() {  # auto-detection for partial or empty target
+    local srun=$(type -p srun)
+    local aprun=$(type -p aprun)
+    local fullauto="${UPCXX_CROSS-y}"
+    if [[ ( -z $srun && -z $aprun ) || ( -n $srun && -n $aprun ) ]]; then
+        echo_and_die 'ERROR: Unable to determine Cray XC job scheduler.  Please pass either' \
+                     '`--with-cross=cray-aries-slurm` or `--with-cross=cray-aries-alps`.'
+    elif [[ -n $srun ]]; then
+       UPCXX_CROSS='cray-aries-slurm'
+    else
+       UPCXX_CROSS='cray-aries-alps'
+    fi
+    warnings+="\nINFO: Cross-compiling for target '$UPCXX_CROSS' based on current environment.\n"
+    if [[ $fullauto == 'y' ]]; then
+        warnings+='INFO: You may pass `--without-cross` to disable cross-compilation.\n'
+    fi
+}
+if [[ ${UPCXX_CROSS-unset} == 'unset' ]]; then
+    # attempt to auto-detect from environment
+    if [[ $CRAYPE_NETWORK_TARGET == aries ]]; then
+        echo 'INFO: Cray aries network software detected.  Will cross-compile.'
+        cross_aries # auto-detect job scheduler
+    else
+        UPCXX_CROSS=''
+    fi
+else
+    case $UPCXX_CROSS in
+      ''|cray-aries-slurm|cray-aries-alps)
+        # disabled or known/supported: nothing to do
+        ;;
+      *)
+        # explicit but unknown
+        warnings+="\nWARNING: Unrecognized (thus unsupported) cross-compilation target '$UPCXX_CROSS'\n"
+        ;;
+    esac
+fi
+export UPCXX_CROSS
+
+# UPCXX_PYTHON
+# First expand full path or validating existence
+# Second check version
+#
+UPCXX_PYTHON_MIN=2.7.5
+function check_py {
+  $1 -c "import sys; sys.exit(sys.version_info < (${UPCXX_PYTHON_MIN//./,}));" &> /dev/null;
+}
+unset py fpy # given/guessed value and its full path
+if [[ -n $UPCXX_PYTHON ]]; then
+  py="$UPCXX_PYTHON"
+  fpy=$(check_tool_path "$UPCXX_PYTHON") && :  # "&& :" prevents ERR trap but preserves $?
+  if [[ $? -ne 0 ]]; then
+    echo "ERROR: Python interpreter '$UPCXX_PYTHON' $fpy." >&2
+    echo_and_die "Use '--with-python=...' to specify a different Python interpreter."
+  elif [[ $UPCXX_PYTHON =~ ^/ ]]; then
+    python_whence='specified by full path'
+  else
+    python_whence='found in $PATH'
+  fi
+  fpy_ver="$($fpy --version 2>&1)" && :
+  if [[ $? -ne 0 ]]; then
+    echo_and_die "ERROR: Requested python interpreter failed running '$UPCXX_PYTHON --version'"
+  fi
+  if ! check_py $fpy &> /dev/null; then
+    echo "ERROR: Requested python interpreter '$UPCXX_PYTHON' reports version '$fpy_ver'" >&2
+    echo_and_die "ERROR: Python interpreter is older than the minimum of $UPCXX_PYTHON_MIN."
+  fi
+else
+  for py in python python3 python3.{0..20} python2; do
+    tmp=$(type -p "$py" 2>/dev/null || true)
+    if [[ -n $tmp && -x $tmp ]] && check_py $tmp; then
+      fpy="$tmp"
+      break
+    fi
+  done
+  if [[ -z "$fpy" ]]; then
+    echo 'ERROR: No suitable Python interpreter was found in $PATH'
+    echo_and_die "Use '--with-python=...' to specify a Python interpreter ($UPCXX_PYTHON_MIN or newer)."
+  fi
+  python_whence='found in $PATH'
+  fpy_ver="$($fpy --version 2>&1)"
+fi
+if test -z "$UPCXX_INSTALL_QUIET"; then
+  echo "$fpy: $fpy_ver"; echo
+fi
+if [[ -n $UPCXX_PYTHON ]]; then
+  UPCXX_PYTHON="$fpy"
+  check_known_path "$fpy" "Python interpreter '$fpy' $python_whence."
+else
+  # If UPCXX_PYTHON unset, then preserve run-time search of $PATH
+  UPCXX_PYTHON="/usr/bin/env $py"
+fi
+
+#
+# system-checks
+#
+. $UPCXX_SRC/utils/system-checks.sh
+install_to="$PREFIX" sys_info
+platform_sanity_checks
+platform_settings
+export CC
+export CXX
+
+#
+# Find a usable GNU Make
+#
+# NOTES:
+# 1. The current regexp captures the patch level, but it is not yet used.
+# 2. The GMAKE_NEED_{MAJ,MIN} values are also used in the generated Makefile
+#    where the "logic" is more fragile than the shell logic here.
+#    If the minimum is raised don't forget to update that logic too.
+#
+GMAKE_NEED_MAJ=3
+GMAKE_NEED_MIN=80
+function bad_gmake {
+  echo Error: $* >&2
+  echo_and_die "Please set GMAKE (or pass --with-gmake=...) to the path to GNU Make $GMAKE_MIN_VER or newer."
+}
+GMAKE_SHORT="$GMAKE"
+if [[ -n "$GMAKE" ]]; then
+  if [[ -z $(type -p "$GMAKE") ]] ; then
+    bad_gmake "'$GMAKE' not found."
+  fi
+else
+  for x in gmake make; do
+    tmp="$(type -p $x)" || true
+    if [[ -n "$tmp" ]] ; then
+      GMAKE_SHORT="$x"
+      GMAKE="$tmp"
+      break
+    fi
+  done
+  if [[ -z "$GMAKE" ]] ; then
+    bad_gmake "no 'gmake' or 'make' found in \$PATH."
+  fi
+fi
+if [[ $($GMAKE --version | grep ^GNU) =~ ([0-9]+).([0-9]+)(.[0-9]+)? ]]; then
+  maj=${BASH_REMATCH[1]}
+  min=${BASH_REMATCH[2]}
+  if [[ $maj -lt $GMAKE_NEED_MAJ ||
+      ( $maj -eq $GMAKE_NEED_MAJ && $min -lt $GMAKE_NEED_MIN ) ]] ; then
+    bad_gmake "'$GMAKE' is older than $GMAKE_NEED_MAJ.$GMAKE_NEED_MIN"
+  fi
+else
+  bad_gmake "'$GMAKE' does not appear to be GNU Make"
+fi
+echo -e "$GMAKE\nGNU Make version ${BASH_REMATCH[0]}\n"
+
+#
+# Find a usable checksum command
+# "Usable" is defined here as 32 or more alphanumerics characters
+# followed by optional space
+#
+UPCXX_CSUMCMD=''
+for cmd in shasum sha1sum md5sum md5; do
+  if [[ -n $(type -p $cmd) &&
+        $($cmd <<< '') =~ ^[a-zA-Z0-9]{32,}\ ? ]]; then
+    UPCXX_CSUMCMD=$cmd
+    break
+  fi
+done
+if [[ -z "$UPCXX_CSUMCMD" ]]; then
+  warnings+="\nWARNING: The developer targets 'exe' and 'run' are unavailable due to\n"
+  warnings+="WARNING: lack of a usable checksum utility.\n"
+fi
+
+#
+# CUDA/nvcc setup
+# TODO: error reporting could be improved substantially.
+# In particular, we discard (nearly?) all failure output from nvcc
+#
+if [[ $UPCXX_CUDA -eq 1 ]]; then
+  trap - ERR # suspend error handler
+  # UPCXX_CUDA_NVCC: the nvcc utility
+  nvcc=${UPCXX_CUDA_NVCC:-$(type -p nvcc)}
+  if [[ -z "$nvcc" ]]; then
+    echo_and_die '$UPCXX_CUDA_NVCC unset and 'nvcc' not found in $PATH'
+  fi
+  echo "${nvcc}:"
+  $nvcc --version
+  if [[ $? -ne 0 ]]; then
+    echo_and_die "failed to run '$nvcc --version'"
+  fi
+  echo
+  UPCXX_CUDA_NVCC="$nvcc"
+
+  unset cxx_is_nvcc
+  if $CXX --version 2>&1 | grep 'Cuda compiler driver' &> /dev/null; then
+    cxx_is_nvcc=1
+  fi
+
+  # UPCXX_CUDA_CPPFLAGS: pre-processor flags
+  if [[ ${UPCXX_CUDA_CPPFLAGS+set} ]]; then
+    : # Keep existing value
+  elif [[ $cxx_is_nvcc ]]; then
+    UPCXX_CUDA_CPPFLAGS=''
+  else
+    # We run a subprocess w/ output to fd 3, and append $? (w/o trailing newline) to this fd
+    # Bash "read" will yield non-zero due to lack of newline, which we use to capture $rc
+    # Inspired by
+    #    https://stackoverflow.com/questions/16854280
+    #    https://stackoverflow.com/questions/43736021
+    cppflags=''
+    exec 3< <( $nvcc --dryrun -c foo.cpp -o foo.o 2>&1 ; echo -n $?)
+    while IFS= read -u 3 -r line || { rc=$line && break; }; do
+      if [[ "$line" =~ (^#\$ INCLUDES=(.*)) ]]; then
+        set -- ${BASH_REMATCH[2]}
+        for flag in "$@"; do
+          [[ "$flag" =~ ^\" ]] && flag="${flag:1:${#flag}-2}"
+          if [[ "$flag" =~ ^-[ID] ]]; then
+            cppflags+=" $flag"
+          fi
+        done
+      fi
+    done
+    [[ $rc -ne 0 ]] && echo_and_die "failed to run $nvcc (error code $rc) to extract pre-process flags"
+    UPCXX_CUDA_CPPFLAGS=${cppflags# } # strip leading ' ' resulting from simple x+=" $y"
+  fi
+
+  # UPCXX_CUDA_LIBFLAGS: linker flags
+  if [[ ${UPCXX_CUDA_LIBFLAGS+set} ]]; then
+    : # Keep existing value
+  elif [[ $cxx_is_nvcc ]]; then
+    UPCXX_CUDA_LIBFLAGS='-lcuda'
+  else
+    libflags=''
+    # Use incantation similar to one above to yield rc and last line output
+    exec 3< <( $nvcc --dryrun foo.o 2>&1 ; echo -n $?)
+    while IFS= read -u 3 -r line || { rc=$line && break; }; do last=$line; done
+    [[ $rc -ne 0 ]] && echo_and_die "failed to run $nvcc (error code $rc) to extract link flags"
+    set -- $last
+    # Make a pass to remove object files and strip quotes
+    for ((i = 1 ; i <= $# ; i++)); do
+      flag="${@:i:1}"
+      if [[ "$flag" =~ .*\.o\"?$ ]]; then
+        # drop object files
+        set -- "${@:1:i-1}" "${@:i+1}"
+        i=$((i-1))
+      elif [[ "$flag" =~ ^\"(.*)\"$ ]]; then
+        # strip quotes
+        set -- "${@:1:i-1}" "${BASH_REMATCH[1]}" "${@:i+1}"
+      fi
+    done
+    # Second pass actually parses
+    for ((i = 1 ; i <= $# ; i++)); do
+      flag="${@:i:1}"
+      case $flag in
+        -L*|-l*|-Wl,*|-pthread)
+          # Capture this flag
+          libflags+=" $flag"
+          ;;
+        -Xlinker|-rpath)
+          # Capture this flag and its argument
+          i=$((i+1))
+          libflags+=" $flag ${@:i:1}"
+          ;;
+        -Wl,--start-group)
+          # Capture the entire group including its delimiters
+          for ((j = i ; j <= $# ; j++)); do
+            flag="${@:j:1}"
+            libflags+=" $flag"
+            [[ "$flag" == '-Wl,--end-group' ]] && break
+          done
+          ;;
+      esac
+    done
+    UPCXX_CUDA_LIBFLAGS=${libflags# } # strip leading ' ' resulting from simple x+=" $y"
+  fi
+
+  # check that the CUDA Driver API is linkable, adding explicit link flags if needed
+  echo -e "#include <cuda.h>\n#include <cuda_runtime_api.h>\nint main() { cuInit(0); return 0; }" >| conftest.cpp
+  for ldextra in '' '-lcuda' '-framework CUDA' 'FAIL'; do
+    eval $CXX $UPCXX_CUDA_CPPFLAGS conftest.cpp -o conftest.exe $UPCXX_CUDA_LIBFLAGS $ldextra &> /dev/null
+    if [[ $? -eq 0 ]] && ( ./conftest.exe 2>/dev/null ); then
+      [[ -n "$ldextra" ]] && UPCXX_CUDA_LIBFLAGS+=" $ldextra"
+      break
+    fi
+  done
+  rm -f conftest.cpp conftest.exe
+  if [[ "$ldextra" == 'FAIL' ]]; then
+    echo_and_die 'failed to link against CUDA Driver API'
+  fi
+  trap failure_and_die ERR  # restore error handler
+fi
+
+#
+# Default conduit
+#
+case $GASNET_CONDUIT in
+  '')
+    if [[ "$UPCXX_CROSS" =~ -aries- ]]; then
+      GASNET_CONDUIT=aries
+    else
+      GASNET_CONDUIT=smp
+    fi
+    ;;
+  udp|smp|ibv|aries)
+    ;;
+  mpi|ucx)
+    echo -e "WARNING: $GASNET_CONDUIT is not an officially supported network.\n"
+    ;;
+  *)
+    echo_and_die "ERROR: --with-default-network='$GASNET_CONDUIT' is not a valid network"
+    ;;
+esac
+
+#
+# Generate bld/Makefile if needed
+#
+mkdir -p bld
+[[ $(pwd -P) = $UPCXX_SRC ]] || echo "include $UPCXX_SRC/bld/Makefile" > "bld/Makefile"
+
+#
+# Generate top-level Makefile
+#
+cat > Makefile <<EOF
+# This file is generated by the UPC++ configure script
+# Modifications to this file may be overwritten
+#
+# Configure command$fullcmd
+$(: Yes, the following will break at GNU Make 10.0 or if somebody unearths a GNU Make 3.9)
+ifneq (\$(firstword \$(sort \$(MAKE_VERSION) $GMAKE_NEED_MAJ.$GMAKE_NEED_MIN)), $GMAKE_NEED_MAJ.$GMAKE_NEED_MIN)
+\$(error GNU Make $GMAKE_NEED_MAJ.$GMAKE_NEED_MIN or newer required, but this is \$(MAKE_VERSION))
+endif
+export prefix=$PREFIX
+export upcxx_src=$UPCXX_SRC
+export upcxx_bld=$(pwd -P)
+export UPCXX_BASH=$BASH
+export UPCXX_PYTHON=$UPCXX_PYTHON
+export GMAKE=$GMAKE
+export GMAKE_SHORT=$GMAKE_SHORT
+export CONFIG_CC=$CC
+export CONFIG_CXX=$CXX
+export GASNET=$GASNET
+export GASNET_TYPE=$GASNET_TYPE
+export CROSS=$UPCXX_CROSS
+export UPCXX_CSUMCMD=$UPCXX_CSUMCMD
+export UPCXX_MPSC_QUEUE=UPCXX_MPSC_QUEUE_$(tr '[a-z]' '[A-Z]' <<<$UPCXX_MPSC_QUEUE)
+export UPCXX_DBGOPT=$UPCXX_DBGOPT
+export GASNET_UNPACKED=$GASNET_UNPACKED
+export GASNET_CONFIGURE_ARGS=$GASNET_CONFIGURE_ARGS
+export GASNET_CONDUIT=$GASNET_CONDUIT
+export UPCXX_CUDA=$UPCXX_CUDA
+export UPCXX_CUDA_NVCC=$UPCXX_CUDA_NVCC
+export UPCXX_CUDA_CPPFLAGS=$UPCXX_CUDA_CPPFLAGS
+export UPCXX_CUDA_LIBFLAGS=$UPCXX_CUDA_LIBFLAGS
+include \$(upcxx_src)/bld/Makefile.rules
+EOF
+
+#
+# Generate top-level bin/
+#
+mkdir -p bin
+cat >| bin/upcxx <<EOF
+#!$BASH
+function die { echo "upcxx: ERROR: \$*" >&2; exit 1; }
+vars=\$(env UPCXX_META=BUILDDIR $BASH $UPCXX_SRC/utils/upcxx.sh "\$@")
+[[ \$? -ne 0 ]] && die 'pre-parse of command line failed'
+vars=\${vars/UPCXX_NETWORK/GASNET_CONDUIT}
+vars=\${vars/UPCXX_THREADMODE=/UPCXX_BACKEND=gasnet_}
+vars=\${vars/UPCXX_CODEMODE=O3/ASSERT=0 OPTLEV=3 DBGSYM=0}
+vars=\${vars/UPCXX_CODEMODE=debug/ASSERT=1 OPTLEV=0 DBGSYM=1}
+[[ -z "\$UPCXX_QUIET" ]] && echo 'INFO: may need to build the required runtime.  Please be patient.' >&2
+tmp=\$($GMAKE --no-print-directory -f '$PWD/Makefile' upcxx \$vars 2>&1)
+[[ \$? -ne 0 ]] && echo "\$tmp" >&2 && die 'build of the required runtime failed.'
+exec \${tmp##*\$'\n'} "\$@"
+EOF
+cat >| bin/upcxx-run <<EOF
+#!$BASH
+function die { echo "upcxx-run: ERROR: \$*" >&2; exit 1; }
+conduit=\$($UPCXX_PYTHON $UPCXX_SRC/utils/upcxx-run -info "\$@" | grep ^GASNetConduitName: | cut -d' ' -f2 | tr '[A-Z]' '[a-z]'; exit \${PIPESTATUS[0]})
+[[ \$? -ne 0 ]] && die 'pre-parse of command line failed'
+codemode="${UPCXX_DBGOPT% *}" # debug unless only opt configured in
+[[ -z "\$UPCXX_QUIET" ]] && echo 'INFO: may need to build the required runtime.  Please be patient.' >&2
+tmp=\$($GMAKE --no-print-directory -f '$PWD/Makefile' upcxx-run GASNET_CODEMODE=\$codemode GASNET_CONDUIT=\$conduit 2>&1)
+[[ \$? -ne 0 ]] && echo "\$tmp" >&2 && die 'build of the required runtime failed.'
+exec \${tmp##*\$'\n'} "\$@"
+EOF
+cat >| bin/upcxx-meta <<EOF
+#!$BASH
+function die { echo "upcxx-meta: ERROR: \$*" >&2; exit 1; }
+[[ -z "\$UPCXX_QUIET" ]] && echo 'INFO: may need to build the required runtime.  Please be patient.' >&2
+tmp=\$($GMAKE --no-print-directory -f '$PWD/Makefile' upcxx-meta 2>&1)
+[[ \$? -ne 0 ]] && echo "\$tmp" >&2 && die 'build of the required runtime failed.'
+meta=\${tmp##*\$'\n'}
+if [[ "\$1" == "SET" ]] ; then
+  source "\$meta" ""
+elif [[ "\$1" == "DUMP" ]] ; then
+  i=0
+  while read line; do
+    [ \$((i++)) == 0 ] && continue # omit she-bang
+    [ "\$line" == "" ] && break    # empty line signals end
+    echo "\$line"
+  done < "\$meta"
+else
+  exec "\$meta" \$*
+fi
+EOF
+chmod a+rx bin/upcxx bin/upcxx-run bin/upcxx-meta
+
+#
+# Remove any (potentially out-of-date) GASNet builds to ensure they are reconfigured
+#
+[[ -d bld/gasnet.opt   ]] && rm -Rf bld/gasnet.opt
+[[ -d bld/gasnet.debug ]] && rm -Rf bld/gasnet.debug
+
+#
+# Simplify logic when using a GASNet build directory (--enable-single only)
+# Only one of gasnet.opt or gasnet.debug is used
+#
+if [[ "$GASNET_TYPE" == 'build' ]]; then
+  rm -f bld/gasnet.$single
+  ln -s "$GASNET" bld/gasnet.$single
+fi
+
+#
+# Final instructions
+#
+cat << EOF
+UPC++ configuration complete.
+Recommended next steps:
+  1. '$GMAKE_SHORT all'
+  2. '$GMAKE_SHORT check'
+  3. '$GMAKE_SHORT install'
+EOF
+
+#
+# Report on bash if we had to search for it
+#
+if test -n "$UPCXX_REEXEC"; then
+  warnings+="\nWARNING: The initial shell was not bash version $UPCXX_BASH_MAJ.$UPCXX_BASH_MIN or newer.\n"
+  warnings+="WARNING: Using '$BASH', found in \$PATH.\n"
+  check_known_path "$BASH"
+  warnings+="NOTE: Run 'full_path_to_bash $0 [args]' to override the automatic detection.\n"
+fi
+
+if [[ -n "$warnings" ]] ; then
+  echo -e "\n********\n${warnings}\n********\n"
+fi
+
+exit 0

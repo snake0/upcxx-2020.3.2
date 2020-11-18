@@ -1,0 +1,274 @@
+#
+# Makefile for tests
+#
+# This file is distinct from Makefile.rules which contains `.NOTPARALLEL`.
+# This split is necessary for parallel builds of tests.
+
+default: force; @echo ERROR: no default target; exit 1
+
+force:
+
+MAKEFLAGS += --no-print-directory
+export SHELL = $(UPCXX_BASH)
+
+# For making a target in *this* Makefile
+# Folding in $(MAKE) here runs afoul of special (parallel)
+# treatment of recipes containing the literal token `$(MAKE)`.
+MAKE_HERE = -f $(upcxx_src)/bld/Makefile.tests
+
+# To prevent application of pass-through rule upon 'include':
+$(upcxx_src)/bld/%.mak: ; @: # empty rule
+
+BLDDIR = $(upcxx_bld)/bld
+
+## GASNet ##
+include $(upcxx_src)/bld/gasnet.mak
+GASNET_BLDDIR = $(BLDDIR)/gasnet.$(firstword $(UPCXX_DBGOPT))
+CONDUITS  = $(call GASNET_VAR,$(GASNET_BLDDIR),CONDUITS)
+EXESUFFIX = $(call GASNET_VAR,$(GASNET_BLDDIR),EXESUFFIX)
+
+## Tests ##
+include $(upcxx_src)/bld/tests.mak
+
+# public-facing targets don't use GASNet "conduit" terminology
+# using "target-specific variable values" for the defaults
+tests test_install run-tests : NETWORKS ?= $(filter-out $(UNOFFICIAL_CONDUITS),$(CONDUITS))
+check              : NETWORKS ?= $(GASNET_CONDUIT)
+export NETWORKS
+
+# Pick 'debug' for building tests, unless --enable-single=opt
+ifeq ($(strip $(UPCXX_DBGOPT)),opt)
+UPCXX_CODEMODE       = O3
+UPCXX_TESTS_GASNET   = opt
+else
+UPCXX_CODEMODE       = debug
+UPCXX_TESTS_GASNET   = debug
+endif
+
+# Compile prerequisites for 'check' or 'tests'
+# Build is restricted to single codemode and the networks in $(NETWORKS)
+do-test-prereqs: force
+	@echo 'Building dependencies...'; \
+	 $(MAKE) -C $(BLDDIR) GASNET_CONDUITS="$(NETWORKS)" do-upcxx-all-$(UPCXX_TESTS_GASNET) || \
+         $(MAKE) failure TARGET=build
+
+.PHONY: do-test-prereqs
+
+# Compile and run tests for default conduit
+check: force
+	@$(MAKE) $(MAKE_HERE) -s do-test-prereqs
+	@if [[ '$(strip $(NETWORKS))' = '$(strip $(GASNET_CONDUIT))' ]]; \
+	   then scope='the default network,';                            \
+	   else scope='specified';                                       \
+	 fi;                                                             \
+	 echo '************'; \
+	 echo "Compiling and running tests for $$scope NETWORKS='$(strip $(NETWORKS))'."; \
+	 echo 'Please, ensure you are in a proper environment for launching parallel jobs'; \
+	 echo '(eg batch system session, if necessary) or the run step may fail.'; \
+	 echo '************'; \
+	 echo ; sleep 5
+	@$(MAKE) $(MAKE_HERE) do-tests UPCXX_BINDIR=$(upcxx_bld)/bin UPCXX_QUIET=1 UPCXX_SKIP_REBUILD=1
+	@$(MAKE) $(MAKE_HERE) do-run-tests UPCXX_BINDIR=$(upcxx_bld)/bin UPCXX_QUIET=1 UPCXX_SKIP_REBUILD=1
+	@echo 'Recommended next steps:';  \
+	 echo "  If you have not already, you may now '$(GMAKE_SHORT) install'"
+
+.PHONY: check
+
+# We encode '/' as '..' to allow this pattern rule to work
+do-build-%: force
+	@IFS=- read name threadmode network <<<$*;       \
+	 src=$${name/..//};                              \
+	 exe="test-$$(basename $$src .cpp)-$$network";   \
+	 ( if [[ '$(UPCXX_VERBOSE)' == 1 ]]; then set -x; fi;  \
+	   UPCXX_CODEMODE=$(UPCXX_CODEMODE)              \
+	   UPCXX_THREADMODE=$$threadmode                 \
+	   UPCXX_NETWORK=$$network                       \
+	   $(UPCXX_BINDIR)/upcxx $(upcxx_src)/test/$$src \
+	                         -o $$exe$(EXESUFFIX) ); \
+	 if [[ $$? == 0 ]]; then                         \
+	   printf 'Compiling %-30s SUCCESS\n' "$$exe";   \
+	 else                                            \
+	   printf 'Compiling %-30s FAILED\n' "$$exe";    \
+	   exit 1;                                       \
+	 fi
+
+# UPCXX_TESTS defaults to all, but test_install (for instance) may override
+UPCXX_TESTS ?= $(addsuffix -seq,$(testprograms_seq)) $(addsuffix -par,$(testprograms_par))
+
+# Build UPCXX_TESTS (default all)
+# UPCXX_CODEMODE is 'debug' if supported
+# Default network (if included in NETWORKS) is built last to keep it on user's screen
+#
+# Summary is provided if NOT building in parallel
+do-tests: force
+	@for network in $(filter-out $(GASNET_CONDUIT),$(NETWORKS)) \
+	                $(filter $(GASNET_CONDUIT),$(NETWORKS)); do \
+	   for test in $(UPCXX_TESTS); do                    \
+	     targets+=" do-build-$${test/\//..}-$$network";  \
+	   done;                                             \
+	 done;                                               \
+	 if [[ -n '$(filter -j%,$(MAKEFLAGS))' ]]; then      \
+	   $(MAKE) $(MAKE_HERE) $$targets || exit $$?;       \
+	   echo;                                             \
+	 else                                                \
+	   total=0; failed=0;                                \
+	   for target in $$targets; do                       \
+	     $(MAKE) $(MAKE_HERE) $$target;                  \
+	     : $$((failed += ($$? != 0))) $$((total += 1));  \
+	   done;                                             \
+	   if [[ $$failed = 0 ]]; then                       \
+	     echo -e "\nPASSED compiling $$total tests\n";   \
+	   else                                              \
+	     echo -e "\nFAILED to compile $$failed of $$total tests\n";\
+	     exit 1;                                         \
+	   fi;                                               \
+	 fi
+
+# All networks, codemodes and seq/par
+# No test-* executables left on disk upon success
+test_install: force
+	@echo 'Testing UPC++ installation at $(prefix)...'; \
+	 if [[ ! -x $(prefix)/bin/upcxx-run ]]; then \
+	   echo 'ERROR: No UPC++ installation found at $(prefix)'; \
+	   echo "ERROR: Please build the 'install' target before 'test_install'."; \
+	   exit 1; \
+	 fi
+	@for codemode in $(UPCXX_DBGOPT); do                    \
+	   for threadmode in seq par; do                        \
+	     echo "========";                                   \
+	     echo "Compiling for UPCXX_CODEMODE=$$codemode UPCXX_THREADMODE=$$threadmode"; \
+	     echo "========";                                   \
+	     $(MAKE) $(MAKE_HERE) do-tests                      \
+	             UPCXX_BINDIR=$(prefix)/bin                 \
+	             UPCXX_TESTS=hello_upcxx.cpp-$$threadmode   \
+	             UPCXX_TEST_CODEMODE=$$codemode;            \
+	     if [[ $$? != 0 ]]; then                            \
+	       $(MAKE) failure TARGET=test_install;             \
+	       exit 1;                                          \
+	     fi;                                                \
+	   done;                                                \
+	 done
+	@rm -f $(call ALL_TESTS,$(NETWORKS))
+	@echo ' '; \
+	 echo '       ==== UPC++ TESTS SUCCESSFULLY COMPILED ===='; \
+	 echo ' '; \
+	 echo 'The UPC++ installation at $(prefix)'; \
+	 echo 'appears to be working for the following networks:'; \
+	 echo ' '; \
+	 echo '  $(NETWORKS)'; \
+	 echo ' '
+
+.PHONY: do-post-install-test-script
+do-post-install-test-script: force
+	mkdir -p $(DESTDIR)$(prefix)/bin
+	@(                                                                \
+	 echo '#!$(UPCXX_BASH)';                                          \
+	 echo 'function shout { echo -e "========\n$$*\n========"; }';    \
+	 echo 'shout "Testing the UPC++ install at $(prefix)"';           \
+	 echo 'WORKDIR=$${TMPDIR:-/tmp}';                                 \
+	 echo 'cd $$WORKDIR';                                             \
+	 echo 'if [[ $$? != 0 ]]; then';                                  \
+	 echo '  echo ABORTING - Failed to cd to $$WORKDIR';              \
+	 echo '  exit 1';                                                 \
+	 echo 'fi';                                                       \
+	 echo 'UPCXX="$(prefix)/bin/upcxx"';                              \
+	 echo 'STEM="test-upcxx-$$$$"';                                   \
+	 echo 'SRCFILE="$$STEM.cpp"';                                     \
+	 echo 'EXEFILE="$$STEM$(EXESUFFIX)"';                             \
+	 echo 'for file in $$SRCFILE $$EXEFILE; do';                      \
+	 echo '  if [[ -e $$file ]]; then';                               \
+	 echo '    shout ABORTING';                                       \
+	 echo '    echo Would overwrite existing $$WORKDIR/$$file.';      \
+	 echo '    exit 1';                                               \
+	 echo '  fi';                                                     \
+	 echo 'done';                                                     \
+	 echo 'PS4=';                                                     \
+	 echo 'function cleanup { rm -f $$SRCFILE $$EXEFILE; }';          \
+	 echo 'trap cleanup EXIT';                                        \
+	 echo 'cat > $$SRCFILE <<_EOF';                                   \
+	 echo '#include <upcxx/upcxx.hpp>';                               \
+	 echo '#include <iostream>';                                      \
+	 echo '#include <sstream>';                                       \
+	 echo 'int main() {';                                             \
+	 echo '  upcxx::init();';                                         \
+	 echo '  std::ostringstream oss;';                                \
+	 echo '  oss << "Hello from "<<upcxx::rank_me()<<" of "<<upcxx::rank_n()<<std::endl;'; \
+	 echo '  std::cout << oss.str() << std::flush;';                  \
+	 echo '  upcxx::finalize();';                                     \
+	 echo '  return 0;';                                              \
+	 echo '}';                                                        \
+	 echo '_EOF';                                                     \
+	 echo 'for codemode in $(subst opt,O3,$(UPCXX_DBGOPT)); do';      \
+	 echo '  for threadmode in seq par; do';                          \
+	 echo '    for network in $(filter-out $(UNOFFICIAL_CONDUITS),$(CONDUITS)); do'; \
+	 echo '      (set -x; $$UPCXX -codemode=$$codemode \';            \
+	 echo '                      -threadmode=$$threadmode \';         \
+	 echo '                      -network=$$network \';               \
+	 echo '                      $$SRCFILE -o $$EXEFILE)';            \
+	 echo '      if [[ $$? != 0 ]]; then';                            \
+	 echo '        shout FAILED; exit 1';                             \
+	 echo '      fi';                                                 \
+	 echo '    done';                                                 \
+	 echo '  done';                                                   \
+	 echo 'done';                                                     \
+	 echo 'shout SUCCESS';                                            \
+	 echo 'exit 0';                                                   \
+	) >| $(DESTDIR)$(prefix)/bin/test-upcxx-install.sh
+	chmod 755 $(DESTDIR)$(prefix)/bin/test-upcxx-install.sh
+
+tests: force
+	@$(MAKE) $(MAKE_HERE) do-test-prereqs
+	@$(MAKE) $(MAKE_HERE) do-tests UPCXX_BINDIR=$(upcxx_bld)/bin UPCXX_QUIET=1 UPCXX_SKIP_REBUILD=1
+	@echo ' '; \
+	 echo '       ==== UPC++ TESTS SUCCESSFULLY COMPILED ===='; \
+	 echo ' '; \
+	 echo 'Your UPC++ build appears to be working for the following networks:'; \
+	 echo ' '; \
+	 echo '  $(NETWORKS)'; \
+	 echo ' '; \
+	 echo 'You may now test UPC++ runtime operation for each network of interest.'; \
+	 echo 'First, ensure you are in a proper environment for launching parallel jobs'; \
+	 echo '(eg batch system session, if necessary) and then issue a command like:'; \
+	 echo ' '; \
+	 echo '  $(upcxx_bld)/bin/upcxx-run -n 2 ./test-hello_upcxx-$(firstword $(NETWORKS))'; \
+	 echo ' '; \
+	 echo 'And similarly for any other of the tests compiled above.'
+
+ALL_TESTS = $(foreach test, $(notdir $(testprograms_seq) $(testprograms_par)), \
+            $(foreach network, $(1), test-$(basename $(test))-$(network)))
+
+tests-clean: force
+	rm -f $(call ALL_TESTS,$(ALL_CONDUITS))
+
+.PHONY: do-tests test_install tests tests-clean
+
+do-run-tests: force
+	@tmpfile=.testtmp_$$$$; rm -f $$tmpfile;                        \
+	 if [[ -z "$(RANKS)" ]]; then ranks=4; else ranks=$(RANKS); fi; \
+	 total=0; failed=0;                                             \
+	 echo "Running tests with RANKS=$$ranks";                       \
+	 for test in $(call ALL_TESTS,$(NETWORKS)); do                  \
+	   [[ -x $$test ]] || continue;                                 \
+	   echo "Running $$test"; : $$((++total));                      \
+	   $(UPCXX_BINDIR)/upcxx-run -np $$ranks ./$$test &> $$tmpfile; \
+	   if [[ $$? != 0 ]] || grep -q ERROR $$tmpfile; then           \
+	     echo FAILED; : $$((++failed));                             \
+	   fi;                                                          \
+	   grep "Test result: " $$tmpfile | sort -u;                    \
+	 done;                                                          \
+	 rm -f $$tmpfile;                                               \
+	 if [[ $$failed = 0 ]]; then                                    \
+	   echo "PASSED running $$total tests";                         \
+	 else                                                           \
+	   echo "FAILED running $$failed of $$total tests";             \
+	   $(MAKE) failure TARGET=tests;                                \
+	 fi;                                                            \
+	 [[ $$failed = 0 ]] # exit code
+
+run-tests: force
+	@$(MAKE) $(MAKE_HERE) do-run-tests UPCXX_BINDIR=$(upcxx_bld)/bin UPCXX_QUIET=1
+
+run-tests-installed: force
+	@$(MAKE) $(MAKE_HERE) do-run-tests UPCXX_BINDIR=$(prefix)/bin
+
+.PHONY: do-run-tests run-tests run-tests-installed

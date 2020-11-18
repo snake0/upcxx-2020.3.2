@@ -1,0 +1,116 @@
+#
+# Top-level Makefile, minus the configuration variables
+#
+
+SHELL = $(UPCXX_BASH)
+DST =
+
+default: all ; @: # empty rule
+
+force:
+
+MAKEFLAGS += --no-print-directory
+
+# Echo an arbitrary make/environment variable
+echovar: force; @echo $(VARNAME)=\"$($(VARNAME))\"
+
+# To prevent application of pass-through rule upon 'include':
+Makefile $(upcxx_src)/bld/Makefile.rules $(upcxx_src)/bld/Makefile.tests: ; @: # empty rule
+$(upcxx_src)/bld/%.mak: ; @: # empty rule
+
+BLDDIR = $(upcxx_bld)/bld
+GASNET_BLDDIR = $(BLDDIR)/gasnet.$(firstword $(UPCXX_DBGOPT))
+
+include $(upcxx_src)/bld/gasnet.mak
+CONDUITS  = $(call GASNET_VAR,$(GASNET_BLDDIR),CONDUITS)
+
+install-hook: force
+	@CONDUITS='$(CONDUITS)';                             \
+	 cd $(upcxx_src) &&                                  \
+	 . utils/install-common.sh &&                        \
+	 conduit_default="$$GASNET_CONDUIT" &&               \
+	 install_to="$(prefix)" install_common
+
+install install-opt install-debug: force
+	@$(MAKE) -C $(BLDDIR) $@ || $(MAKE) failure TARGET=installation
+	@$(MAKE) install-hook || $(MAKE) failure TARGET=installation
+	@echo; \
+	 echo 'UPC++ installation complete.'; \
+	 echo 'Recommended next steps:'; \
+	 echo '  See "Post-install recommendations" in'; \
+	 echo '  $(upcxx_src)/INSTALL.md'
+
+all all-opt all-debug: force
+	@$(MAKE) -C $(BLDDIR) $@ || $(MAKE) failure TARGET=build
+	@echo; \
+	 echo 'UPC++ build complete.';    \
+	 echo 'Recommended next steps:';  \
+	 echo "  1. '$(GMAKE_SHORT) check'";    \
+	 echo "  2. '$(GMAKE_SHORT) install'"
+
+distclean-hook: force
+	-[[ $(upcxx_src) = $(upcxx_bld) ]] || rm -R $(BLDDIR)/Makefile
+	-rm -Rf $(upcxx_bld)/Makefile $(upcxx_bld)/bin/upcxx $(upcxx_bld)/bin/upcxx-run $(upcxx_bld)/bin/upcxx-meta $(GASNET_UNPACKED)
+
+distclean: force
+	@$(MAKE) -C $(BLDDIR) $@
+	@$(MAKE) $@-hook
+
+EXE_VPATH = "$(upcxx_src)/test" "$(upcxx_src)/example" "$(upcxx_src)/bench"
+exe run: force
+	@if test -z "$(SRC)"; then \
+	    echo "ERROR: target '$@' requires a SRC" >&2; \
+	    echo "example: 'make $@ SRC=test/hello_upcxx.cpp'" >&2; \
+	    exit 1; \
+	 fi
+	@src=$(SRC);                                                   \
+	 if [[ ! -f "$(SRC)" && "$(SRC)" != /* ]]; then                \
+	   for d in $$(find $(EXE_VPATH) -type d); do                  \
+	     if [[ -f "$$d/$(SRC)" ]]; then                            \
+	       src="$$d/$(SRC)"; break;                                \
+	     fi                                                        \
+	   done;                                                       \
+	   if [[ -z "$$src" ]]; then                                   \
+	    echo "ERROR: file SRC='$(SRC)' does not exist" >&2;        \
+	    exit 1;                                                    \
+	   fi                                                          \
+	 fi;                                                           \
+	 $(MAKE) -C $(BLDDIR) $@ SRC="$$src" STARTDIR="$(shell pwd)"
+
+# Default is pass-through
+# TODO?: HOOK and LOCAL "magic" like UPCR's multiconf
+%: force; @$(MAKE) -C $(BLDDIR) $@
+
+failure: force
+	@echo -e '\n********\nUPC++ $(TARGET) failed. Please report the ENTIRE log above to: upcxx@googlegroups.com\n********\n' >&2
+	@exit 1
+
+.PHONY: force echovar failure
+.PHONY: install install-hook
+.PHONY: distclean distclean-hook
+.PHONY: exe run
+
+## Check/tests targets pass-through to their own Makefile
+TEST_TARGETS = check tests tests-clean test_install run-tests run-tests-installed
+$(TEST_TARGETS): force; @$(MAKE) -f $(upcxx_src)/bld/Makefile.tests $@
+.PHONY: $(TEST_TARGETS)
+
+## GASNet pass-through
+# usage: make gasnet [DO_WHAT=target] [NETWORK=xyz] [UPCXX_CODEMODE={O3,debug}]
+#   DO_WHAT defaults to 'all'
+#   NETWORK defaults to the default network
+#   UPCXX_CODEMODE defaults to 'debug' (unless `--enable-single=opt`)
+gasnet: force
+	@case '$(UPCXX_CODEMODE)' in                   \
+           '') codemode=$(firstword $(UPCXX_DBGOPT));; \
+           O3) codemode=opt;;                          \
+	    *) codemode=$(UPCXX_CODEMODE);;            \
+	 esac;                                         \
+	 set -x;                                       \
+	 $(MAKE) "$${DO_WHAT:-all}"                    \
+	         -C "$(BLDDIR)/gasnet.$$codemode/$${NETWORK:-$(GASNET_CONDUIT)}-conduit"
+PHONY: gasnet
+
+
+
+.NOTPARALLEL:
